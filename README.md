@@ -2,6 +2,8 @@
 
 Set up inbound and outbound email for your [OpenClaw](https://github.com/openclaw/openclaw) agent in ~15 minutes. All free tiers.
 
+> **Note:** This guide is for a **local machine** (laptop/desktop/Mac Mini). If you're running OpenClaw on a **VPS** with a public IP, you can skip the Tailscale Funnel step entirely — just point your Cloudflare Worker directly at `https://your-vps-ip:18789/hooks/email` (with proper TLS via reverse proxy like Caddy or nginx).
+
 **Stack:** Cloudflare Email Routing → Cloudflare Worker → Tailscale Funnel → OpenClaw Webhook → Slack
 
 ---
@@ -66,7 +68,9 @@ export default {
 
 ### 3. Expose OpenClaw to the Internet (Tailscale Funnel)
 
-Your OpenClaw gateway needs to be reachable from Cloudflare. [Tailscale Funnel](https://tailscale.com/kb/1223/tailscale-funnel/) is the easiest way.
+> **VPS users:** Skip this step. Your machine is already public. Use a reverse proxy (Caddy, nginx) to terminate TLS and forward to `localhost:18789`.
+
+Your OpenClaw gateway needs to be reachable from Cloudflare. For local machines, [Tailscale Funnel](https://tailscale.com/kb/1223/tailscale-funnel/) is the easiest way.
 
 ```bash
 # Install Tailscale if you haven't
