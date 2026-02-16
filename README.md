@@ -150,6 +150,118 @@ Send an email to `agent@yourdomain.com` and watch it arrive in Slack via your ag
 
 ---
 
+## Plus Addressing (Route Emails to Different Channels)
+
+Want different emails to go to different Slack channels? Use **plus addressing** with a catch-all rule.
+
+### How It Works
+
+```
+agent+project-a@yourdomain.com → #project-a channel
+agent+support@yourdomain.com   → #support channel
+agent@yourdomain.com           → default channel (DM or general)
+```
+
+### Setup
+
+#### 1. Enable Catch-All in Cloudflare
+
+In **Email Routing**, set up a **Catch-all address** that routes to your worker. This captures `agent+anything@yourdomain.com` addresses that don't have explicit rules.
+
+#### 2. Update the Worker to Parse Plus Tags
+
+```javascript
+export default {
+  async email(message, env) {
+    const to = message.to;
+    const from = message.from;
+    const subject = message.headers.get("subject") || "(no subject)";
+
+    // Parse plus tag: agent+project-a@domain.com → "project-a"
+    const match = to.match(/^([^+]+)\+([^@]+)@/);
+    const tag = match ? match[2] : null;
+    const baseAddress = match ? `${match[1]}@${to.split("@")[1]}` : to;
+
+    // Read body
+    const rawEmail = await new Response(message.raw).text();
+    const bodyStart = rawEmail.indexOf("\r\n\r\n");
+    const body = bodyStart > -1 ? rawEmail.slice(bodyStart + 4, bodyStart + 4000) : "";
+
+    // POST to OpenClaw webhook
+    await fetch(env.WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${env.WEBHOOK_TOKEN}`,
+      },
+      body: JSON.stringify({
+        to,
+        from,
+        subject,
+        tag,           // null if no plus tag
+        baseAddress,   // agent@domain.com (without the +tag)
+        body: body.trim().slice(0, 4000),
+      }),
+    });
+  },
+};
+```
+
+#### 3. Update OpenClaw Webhook Config
+
+Include `{{tag}}` in your message template:
+
+```json
+{
+  "hooks": {
+    "enabled": true,
+    "path": "/hooks",
+    "token": "your-secret-token-here",
+    "mappings": [
+      {
+        "match": { "path": "email" },
+        "action": "agent",
+        "wakeMode": "now",
+        "name": "Email (agent@yourdomain.com)",
+        "messageTemplate": "📧 Email received\nTo: {{to}}\nTag: {{tag}}\nFrom: {{from}}\nSubject: {{subject}}\n\n{{body}}",
+        "deliver": true,
+        "channel": "slack",
+        "to": "channel:YOUR_DEFAULT_CHANNEL_ID"
+      }
+    ]
+  }
+}
+```
+
+#### 4. Teach Your Agent the Routing Rules
+
+Add to your agent's memory (e.g., `MEMORY.md` or `SOUL.md`):
+
+```markdown
+## Email Routing Rules
+
+**Inbound:** When I receive an email with a plus tag (e.g., agent+support@domain.com), 
+post a summary to the Slack channel matching that tag name. No tag = DM to owner.
+
+**Outbound:** When sending emails from a specific channel context, use the plus tag 
+for that channel (e.g., from #support → send as agent+support@domain.com). 
+This ensures replies route back to the right channel.
+
+**Tag → Channel Mapping:**
+- `support` → C0ABC123 (#support)
+- `sales` → C0DEF456 (#sales)
+- `project-a` → C0GHI789 (#project-a)
+```
+
+### Benefits
+
+- **Automatic routing** — Emails tagged with `+channel-name` go to that channel
+- **Reply threading** — When your agent sends FROM a channel using the plus tag, replies come back to the same channel
+- **One email address** — No need to create multiple email addresses or workers
+- **Zero config for new channels** — Just use `agent+new-channel@domain.com` and add to the mapping
+
+---
+
 ## Cost
 
 | Service | Tier | Limit |
