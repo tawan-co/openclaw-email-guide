@@ -15,7 +15,7 @@ Inbound email → Cloudflare Email Routing → Cloudflare Worker
     → POST JSON to OpenClaw webhook (via Tailscale Funnel)
     → Agent reads, summarizes, delivers to Slack
 
-Outbound email → Resend API → recipient
+Outbound email → Cloudflare Worker (allowlist) → Resend API → recipient
 ```
 
 Your agent gets a real email address (e.g. `agent@yourdomain.com`). When someone emails it, your agent wakes up, reads the message, and notifies you. It can also send emails on your behalf via Resend.
@@ -133,16 +133,177 @@ In the Cloudflare dashboard, set your Worker's environment variables:
 | `WEBHOOK_URL` | `https://your-machine.tailnet-name.ts.net/hooks/email` |
 | `WEBHOOK_TOKEN` | The token from step 4 |
 
-### 6. Outbound Email (Resend)
+### 6. Outbound Email (Secure Gateway)
 
-To let your agent *send* emails:
+To let your agent *send* emails safely, use a **Cloudflare Worker as a gateway** with an allowlist. This ensures your agent can only email addresses you've explicitly authorized — enforced at the infrastructure level.
 
-1. Create a [Resend](https://resend.com) account
+> ⚠️ **Why a gateway?** If you give your agent direct access to an email API key, it could theoretically email anyone. A jailbreak, prompt injection, or bug could result in spam or worse. The gateway pattern enforces an allowlist server-side — the agent physically cannot bypass it.
+
+#### 6a. Create a Resend Account
+
+1. Sign up at [Resend](https://resend.com)
 2. Add your domain and verify DNS records
-3. Get an API key
-4. Store it securely (e.g. 1Password, env var)
+3. Get an API key — **keep this secret, never share with your agent**
 
-Your agent can now send emails via the Resend API.
+#### 6b. Create the Send Gateway Worker
+
+Create a new Cloudflare Worker for outbound email:
+
+```javascript
+export default {
+  async fetch(request, env) {
+    // Only POST
+    if (request.method !== 'POST') {
+      return new Response('Method not allowed', { status: 405 });
+    }
+
+    // Check auth token
+    const authHeader = request.headers.get('Authorization');
+    if (authHeader !== `Bearer ${env.AUTH_TOKEN}`) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+
+    // Parse request
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response('Invalid JSON', { status: 400 });
+    }
+
+    const { to, subject, text, replyTo } = body;
+    if (!to || !subject || !text) {
+      return new Response('Missing required fields: to, subject, text', { status: 400 });
+    }
+
+    // ============================================
+    // ALLOWLIST — edit this list to control who
+    // your agent can email. Add addresses here.
+    // ============================================
+    const ALLOWLIST = [
+      'you@example.com',
+      'trusted-contact@example.com',
+      // Add more as needed
+    ];
+
+    if (!ALLOWLIST.includes(to.toLowerCase())) {
+      return Response.json(
+        { error: `Recipient ${to} not in allowlist` }, 
+        { status: 403 }
+      );
+    }
+
+    // Send via Resend
+    const resendRes = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: `Agent <agent@yourdomain.com>`,
+        to: [to],
+        reply_to: replyTo || 'agent@yourdomain.com',
+        subject,
+        text,
+      }),
+    });
+
+    const result = await resendRes.json();
+    
+    if (result.id) {
+      return Response.json({ success: true, id: result.id });
+    } else {
+      return Response.json({ error: result }, { status: 500 });
+    }
+  },
+};
+```
+
+#### 6c. Configure Worker Environment Variables
+
+In the Cloudflare dashboard, add these secrets to your Worker:
+
+| Variable | Value |
+|----------|-------|
+| `RESEND_API_KEY` | Your Resend API key |
+| `AUTH_TOKEN` | Generate a random token (e.g. `openssl rand -hex 32`) |
+
+#### 6d. Create a Local Send Script
+
+On your machine, create a script that calls the gateway:
+
+```javascript
+#!/usr/bin/env node
+// scripts/send-email.js
+
+const https = require('https');
+
+const args = process.argv.slice(2);
+const getArg = (name) => {
+  const idx = args.indexOf(`--${name}`);
+  return idx > -1 ? args[idx + 1] : null;
+};
+
+const to = getArg('to');
+const subject = getArg('subject');
+const body = getArg('body');
+
+if (!to || !subject || !body) {
+  console.error('Usage: node send-email.js --to <email> --subject <subject> --body <body>');
+  process.exit(1);
+}
+
+// Your gateway URL and auth token
+const GATEWAY_URL = 'https://send-email.yourdomain.workers.dev';
+const AUTH_TOKEN = 'your-auth-token-here';
+
+const payload = JSON.stringify({ to, subject, text: body });
+
+const url = new URL(GATEWAY_URL);
+const options = {
+  hostname: url.hostname,
+  path: url.pathname,
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${AUTH_TOKEN}`,
+    'Content-Length': Buffer.byteLength(payload)
+  }
+};
+
+const req = https.request(options, (res) => {
+  let data = '';
+  res.on('data', chunk => data += chunk);
+  res.on('end', () => {
+    const result = JSON.parse(data);
+    if (result.success) {
+      console.log(`✅ Email sent to ${to}`);
+    } else {
+      console.error(`❌ Blocked: ${result.error}`);
+      process.exit(1);
+    }
+  });
+});
+
+req.on('error', (e) => console.error('Request failed:', e.message));
+req.write(payload);
+req.end();
+```
+
+#### 6e. Teach Your Agent
+
+Add to your agent's instructions (e.g., `TOOLS.md`):
+
+```markdown
+### Email Sending (ENFORCED)
+- **ALWAYS use:** `scripts/send-email.js`
+- **NEVER call any email API directly**
+- Allowlist is server-side — you cannot modify it
+- Usage: `node scripts/send-email.js --to <email> --subject <subject> --body <body>`
+```
+
+Now your agent can only email addresses in your allowlist, and you control that list entirely.
 
 ### 7. Test It
 
